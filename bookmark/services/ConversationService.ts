@@ -1,94 +1,149 @@
-import { ConversationSession, ConversationMessage, Note } from '../types/conversation';
-import { BookChunk } from '../types/book';
+import { RAGService } from './RAGService';
+import { ModelService } from './ModelService';
+import { DatabaseService } from './DatabaseService';
+import { BookProcessor } from './BookProcessor';
+import { Book } from '../types/book';
+
+interface ConversationState {
+  bookId: string;
+  history: { role: 'user' | 'assistant'; content: string }[];
+}
 
 export class ConversationService {
-  private contextWindow: number = 2048;
-  private currentSession: ConversationSession | null = null;
+  private static instance: ConversationService;
+  private ragService: RAGService;
+  private modelService: ModelService;
+  private dbService: DatabaseService;
+  private bookProcessor: BookProcessor;
+  private isInitialized: boolean = false;
+  private currentState: ConversationState | null = null;
 
-  async startSession(bookId: string): Promise<ConversationSession> {
-    this.currentSession = {
-      id: `session_${Date.now()}`,
-      bookId,
-      startTime: new Date(),
-      messages: [],
-    };
-    return this.currentSession;
+  private constructor() {
+    this.ragService = RAGService.getInstance();
+    this.modelService = ModelService.getInstance();
+    this.dbService = DatabaseService.getInstance();
+    this.bookProcessor = BookProcessor.getInstance();
   }
 
-  async processUserMessage(
-    message: string,
-    relevantChunks: BookChunk[]
-  ): Promise<ConversationMessage> {
-    if (!this.currentSession) {
-      throw new Error('No active session');
+  static getInstance(): ConversationService {
+    if (!ConversationService.instance) {
+      ConversationService.instance = new ConversationService();
+    }
+    return ConversationService.instance;
+  }
+
+  async initialize(onProgress?: (progress: number) => void): Promise<boolean> {
+    if (this.isInitialized) return true;
+
+    try {
+      // Initialize services with progress reporting
+      await Promise.all([
+        this.ragService.initialize((progress) => {
+          if (onProgress) onProgress(progress * 0.6); // 60% for RAG
+        }),
+        this.modelService.initialize((progress) => {
+          if (onProgress) onProgress(0.6 + progress * 0.4); // 40% for Model
+        }),
+      ]);
+
+      this.isInitialized = true;
+      return true;
+    } catch (error) {
+      console.error('Error initializing ConversationService:', error);
+      return false;
+    }
+  }
+
+  async setBook(book: Book): Promise<boolean> {
+    if (!this.isInitialized) {
+      throw new Error('ConversationService not initialized');
     }
 
-    const userMessage: ConversationMessage = {
-      id: `msg_${Date.now()}`,
-      sessionId: this.currentSession.id,
-      content: message,
-      timestamp: new Date(),
-      type: 'user',
-      relevantChunks: relevantChunks.map(chunk => chunk.id),
-    };
+    try {
+      // Get processed text from BookProcessor
+      const processedText = await this.bookProcessor.processBook(book);
+      if (!processedText) return false;
 
-    this.currentSession.messages.push(userMessage);
+      // Add text to RAG system
+      await this.ragService.addText(processedText);
 
-    // Generate AI response
-    const aiResponse = await this.generateAIResponse(message, relevantChunks);
-    this.currentSession.messages.push(aiResponse);
+      // Initialize conversation state
+      this.currentState = {
+        bookId: book.id,
+        history: [],
+      };
 
-    return aiResponse;
+      return true;
+    } catch (error) {
+      console.error('Error setting book:', error);
+      return false;
+    }
   }
 
-  private async generateAIResponse(
-    userMessage: string,
-    context: BookChunk[]
-  ): Promise<ConversationMessage> {
-    // TODO: Implement actual LLM inference here
-    // For now, return a mock response
-    return {
-      id: `msg_${Date.now()}_ai`,
-      sessionId: this.currentSession!.id,
-      content: `This is a mock AI response to: "${userMessage}"`,
-      timestamp: new Date(),
-      type: 'ai',
-      relevantChunks: context.map(chunk => chunk.id),
-    };
-  }
-
-  async endSession(): Promise<ConversationSession> {
-    if (!this.currentSession) {
-      throw new Error('No active session');
+  async processMessage(message: string): Promise<string> {
+    if (!this.isInitialized || !this.currentState) {
+      throw new Error('ConversationService not properly initialized');
     }
 
-    this.currentSession.endTime = new Date();
-    this.currentSession.summary = await this.generateSessionSummary();
-    
-    const session = { ...this.currentSession };
-    this.currentSession = null;
-    return session;
-  }
+    try {
+      // Add user message to history
+      this.currentState.history.push({ role: 'user', content: message });
 
-  private async generateSessionSummary(): Promise<string> {
-    if (!this.currentSession) {
-      throw new Error('No active session');
+      // Create system prompt with context
+      let systemPrompt = 'You are a helpful assistant discussing a book. ';
+      systemPrompt += 'Use the provided context to answer questions about the book. ';
+      systemPrompt += 'If you are not sure about something, say so rather than making things up.';
+
+      // Format conversation history
+      const historyContext = this.currentState.history
+        .slice(-4) // Keep last 4 messages for context
+        .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+        .join('\n');
+
+      // Get response using RAG
+      const response = await this.ragService.processQuery(
+        `${historyContext}\nUser: ${message}\nAssistant:`,
+        1024, // max tokens
+        0.7 // temperature
+      );
+
+      // Add assistant response to history
+      this.currentState.history.push({ role: 'assistant', content: response });
+
+      // Save conversation to database
+      await this.dbService.saveConversation(
+        this.currentState.bookId,
+        this.currentState.history
+      );
+
+      return response;
+    } catch (error) {
+      console.error('Error processing message:', error);
+      throw error;
     }
-
-    // TODO: Implement actual summary generation using LLM
-    return `Mock summary of conversation about book ${this.currentSession.bookId}`;
   }
 
-  async extractNote(message: ConversationMessage): Promise<Note> {
-    // TODO: Implement note extraction logic using LLM
-    return {
-      id: `note_${Date.now()}`,
-      sessionId: message.sessionId,
-      bookId: this.currentSession!.bookId,
-      content: `Important point from: ${message.content}`,
-      timestamp: new Date(),
-      type: 'comment',
-      context: message.content,
-    };
+  async getConversationHistory(bookId: string): Promise<{ role: 'user' | 'assistant'; content: string }[]> {
+    try {
+      return await this.dbService.getConversation(bookId);
+    } catch (error) {
+      console.error('Error getting conversation history:', error);
+      return [];
+    }
+  }
+
+  async cleanup(): Promise<void> {
+    try {
+      if (this.isInitialized) {
+        await Promise.all([
+          this.ragService.cleanup(),
+          this.modelService.cleanup(),
+        ]);
+        this.isInitialized = false;
+        this.currentState = null;
+      }
+    } catch (error) {
+      console.error('Error cleaning up ConversationService:', error);
+    }
   }
 }

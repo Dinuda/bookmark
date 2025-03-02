@@ -1,0 +1,34 @@
+#ifdef __OBJC__
+    #import <Foundation/Foundation.h>
+    #import <UIKit/UIKit.h>
+    #import <Metal/Metal.h>
+    #import <React/RCTBridgeModule.h>
+    #import <React/RCTLog.h>
+#endif
+
+// Common C++ includes
+#ifdef __cplusplus
+    #include <string>
+    #include <vector>
+    #include <memory>
+    #include <stdexcept>
+    #include <thread>
+#endif
+
+// Debug logging macros
+#ifdef DEBUG
+    #define LOG_DEBUG(fmt, ...) NSLog((@"[DEBUG] " fmt), ##__VA_ARGS__)
+#else
+    #define LOG_DEBUG(...)
+#endif
+
+#define LOG_ERROR(fmt, ...) NSLog((@"[ERROR] " fmt), ##__VA_ARGS__)
+
+// Metal helpers
+#ifdef __OBJC__
+#define CHECK_METAL_ERROR(error) \
+    if (error) { \
+        LOG_ERROR(@"Metal error: %@", error.localizedDescription); \
+        return; \
+    }
+#endif
